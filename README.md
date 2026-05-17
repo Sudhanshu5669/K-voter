@@ -1,10 +1,10 @@
 # Karuta Top.gg Auto-Voter
 
-Automatically votes for the [Karuta](https://top.gg/bot/646937666251915264/vote) Discord bot on top.gg every **13 hours** using GitHub Actions — no local setup needed after the one-time cookie grab.
+Automatically votes for the [Karuta](https://top.gg/bot/646937666251915264/vote) Discord bot on top.gg every **12 hours** using GitHub Actions — scheduled to run every **6 hours** for fail-safe redundancy.
 
 ## How it works
 
-top.gg uses a GraphQL API (`api.top.gg/graphql`) with a `VoteEntity` mutation for votes. Authentication is handled via your Discord login session cookie (`__Secure-next-auth.session-token`). The workflow runs twice a day (every 13 hours) via GitHub Actions cron and uses the stored cookie to cast the vote on your behalf.
+top.gg uses a GraphQL API (`api.top.gg/graphql`) with a `VoteEntity` mutation for votes. Authentication is handled via your Discord login session cookie (`__Secure-next-auth.session-token`). The workflow runs four times a day (every 6 hours) via GitHub Actions cron and uses the stored cookie to cast the vote on your behalf. If you've already voted within the 12-hour cooldown window, the script safely skips the run to avoid duplicate votes without failing your workflow history.
 
 ## One-time Setup
 
@@ -33,7 +33,7 @@ git commit -m "setup karuta voter"
 git push
 ```
 
-The workflow will now run automatically at **00:00 UTC** and **13:00 UTC** every day.
+The workflow will now run automatically at **00:00 UTC**, **06:00 UTC**, **12:00 UTC**, and **18:00 UTC** every day (running every 6 hours for safety and redundancy).
 
 ## Manual trigger
 
