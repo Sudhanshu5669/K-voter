@@ -1,12 +1,8 @@
 name: Karuta Top.gg Auto-Voter
 
 on:
-  # Run on schedule — every 13 hours
-  # GitHub Actions cron uses UTC. 13h intervals: 00:00, 13:00 UTC
   schedule:
     - cron: "0 0,13 * * *"   # 00:00 UTC and 13:00 UTC every day
-
-  # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
 
 jobs:
@@ -23,8 +19,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install requests
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
 
       - name: Cast vote
         env:

@@ -1,187 +1,168 @@
 #!/usr/bin/env python3
 """
-Karuta Top.gg Auto-Voter
-Votes for Karuta bot on top.gg using the GraphQL API with cookie-based auth.
+Karuta Top.gg Auto-Voter (Playwright edition)
+Uses a real browser context with your session cookie so auth works exactly
+as it does in your browser — no header/cookie guessing needed.
 
-Required environment variables:
-  TOPGG_SESSION_TOKEN  - Value of the __Secure-next-auth.session-token cookie from top.gg
+Required environment variable:
+  TOPGG_SESSION_TOKEN  — value of the __Secure-authjs.session-token cookie
 """
 
 import os
 import sys
-import json
-import uuid
-import base64
-import requests
+import time
 
-# ── Config ────────────────────────────────────────────────────────────────────
-GRAPHQL_URL = "https://api.top.gg/graphql"
-ENTITY_ID   = "4283790394010009600"   # Karuta's internal top.gg entity ID
-BOT_ID      = "646937666251915264"    # Karuta's Discord app/bot ID
-COOKIE_NAME  = "__Secure-authjs.session-token"   # Auth.js v5 cookie name used by top.gg
+VOTE_URL     = "https://top.gg/bot/646937666251915264/vote"
+COOKIE_NAME  = "__Secure-authjs.session-token"
 SESSION_ENV  = "TOPGG_SESSION_TOKEN"
 
-VOTE_MUTATION = """
-mutation VoteEntity($entityId: String!, $encodedData: String!, $query: String!) {
-  voteEntity(entityId: $entityId, encodedData: $encodedData, query: $query) {
-    isAcknowledged
-    newVoteCount
-    canRetry
-    error
-    captchaProvider
-  }
-}
-""".strip()
-
-CHECK_QUERY = """
-query gvs($i: String!) {
-  entity(id: $i) {
-    id
-    voteStatus {
-      timeUntilNextVote
-      status
-      id
-      isSubscribed
-    }
-  }
-}
-""".strip()
-
-HEADERS = {
-    "accept": "application/json",
-    "accept-language": "en",
-    "content-type": "application/json",
-    "origin": "https://top.gg",
-    "referer": "https://top.gg/",
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/148.0.0.0 Safari/537.36"
-    ),
-    "sec-ch-ua": '"Chromium";v="148", "Brave";v="148", "Not/A)Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-site",
-}
-
-
-def make_encoded_data() -> str:
-    """Generate the trace ID payload (base64-encoded JSON) required by the mutation."""
-    trace_id = str(uuid.uuid4())
-    payload = json.dumps({"traceId": trace_id})
-    return base64.b64encode(payload.encode()).decode()
-
-
-def build_cookie_header(session_token: str) -> str:
-    """
-    Build the Cookie header string.
-    top.gg uses Auth.js v5 — the session cookie is __Secure-authjs.session-token.
-    It's same-site with api.top.gg so the browser sends it automatically;
-    we replicate that by including it explicitly in the Cookie header.
-    """
-    return f"{COOKIE_NAME}={session_token}"
-
-
-def check_vote_status(session: requests.Session) -> dict:
-    """Check current vote status for the entity."""
-    payload = {
-        "query": CHECK_QUERY,
-        "operationName": "gvs",
-        "variables": {"i": ENTITY_ID},
-    }
-    resp = session.post(GRAPHQL_URL, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    entity = (data.get("data") or {}).get("entity") or {}
-    return entity.get("voteStatus") or {}
-
-
-def cast_vote(session: requests.Session) -> dict:
-    """Submit the vote mutation."""
-    payload = {
-        "query": VOTE_MUTATION,
-        "operationName": "VoteEntity",
-        "variables": {
-            "entityId": ENTITY_ID,
-            "encodedData": make_encoded_data(),
-            "query": "",
-        },
-    }
-    resp = session.post(GRAPHQL_URL, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if "errors" in data:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
-
-    return data["data"]["voteEntity"]
+# ── How long (ms) to wait for various page events ─────────────────────────
+NAV_TIMEOUT  = 30_000   # page navigation
+BTN_TIMEOUT  = 15_000   # vote button to appear
+POST_CLICK   = 5_000    # settle after click
 
 
 def main() -> None:
     # ── Read session token ─────────────────────────────────────────────────
     session_token = os.environ.get(SESSION_ENV, "").strip()
     if not session_token:
-        print(f"[ERROR] Environment variable '{SESSION_ENV}' is not set or empty.")
-        print(f"Set it to the value of the {COOKIE_NAME} cookie from top.gg.")
+        print(f"[ERROR] '{SESSION_ENV}' env var is not set.")
+        print(f"  Copy the value of {COOKIE_NAME} from top.gg DevTools → Application → Cookies.")
         sys.exit(1)
 
-    # ── Set up session ─────────────────────────────────────────────────────
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.headers["cookie"] = build_cookie_header(session_token)
-
-    print(f"[INFO] Checking vote status for Karuta (entity: {ENTITY_ID}) ...")
+    # Import here so missing dep gives a clear message
     try:
-        status = check_vote_status(session)
-        print(f"[INFO] Vote status: {status}")
-
-        vote_state = status.get("status", "UNKNOWN")
-        time_until_next = status.get("timeUntilNextVote", 0)
-
-        if vote_state == "VOTED":
-            hours = time_until_next / 3600 if time_until_next else 0
-            print(f"[INFO] Already voted. Next vote available in {hours:.1f} hours.")
-            print("[SKIP] No vote cast – exiting cleanly.")
-            sys.exit(0)
-
-    except Exception as e:
-        print(f"[WARN] Could not fetch vote status: {e}. Proceeding to vote anyway ...")
-
-    # ── Cast vote ──────────────────────────────────────────────────────────
-    print("[INFO] Casting vote ...")
-    try:
-        result = cast_vote(session)
-    except requests.HTTPError as e:
-        print(f"[ERROR] HTTP error while voting: {e}")
-        print(f"        Response body: {e.response.text[:500]}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] Unexpected error while voting: {e}")
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        print("[ERROR] Playwright not installed. Run: pip install playwright && playwright install chromium")
         sys.exit(1)
 
-    # ── Interpret result ───────────────────────────────────────────────────
-    acknowledged = result.get("isAcknowledged", False)
-    new_count     = result.get("newVoteCount", "?")
-    can_retry     = result.get("canRetry", False)
-    error         = result.get("error", "NONE")
-    captcha       = result.get("captchaProvider")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/148.0.0.0 Safari/537.36"
+            )
+        )
 
-    if error and error != "NONE":
-        print(f"[ERROR] Vote failed with error: {error}")
-        if captcha:
-            print(f"        Captcha required from provider: {captcha}")
-            print("        ⚠ The session cookie may be stale or the IP is being flagged.")
-        sys.exit(1)
+        # ── Inject session cookie ──────────────────────────────────────────
+        ctx.add_cookies([
+            {
+                "name":     COOKIE_NAME,
+                "value":    session_token,
+                "domain":   "top.gg",
+                "path":     "/",
+                "secure":   True,
+                "httpOnly": True,
+                "sameSite": "Lax",
+            }
+        ])
 
-    if acknowledged:
-        print(f"[SUCCESS] ✅ Vote cast! Total votes for Karuta: {new_count}")
-        if can_retry:
-            print("[INFO]   canRetry=true – weekend double-vote may apply.")
-    else:
-        print(f"[WARN] Vote not acknowledged. Full result: {result}")
-        sys.exit(1)
+        page = ctx.new_page()
+
+        # ── Intercept the GraphQL vote response ───────────────────────────
+        vote_result: dict = {}
+
+        def on_response(response):
+            if "api.top.gg/graphql" in response.url:
+                try:
+                    body = response.json()
+                    ve = (body.get("data") or {}).get("voteEntity")
+                    if ve is not None:
+                        vote_result.update(ve)
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
+        # ── Navigate to vote page ──────────────────────────────────────────
+        print(f"[INFO] Loading {VOTE_URL} ...")
+        try:
+            page.goto(VOTE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+        except PWTimeout:
+            print("[ERROR] Timed out loading the vote page.")
+            browser.close()
+            sys.exit(1)
+
+        # ── Check we're logged in ──────────────────────────────────────────
+        # If the cookie is invalid, top.gg redirects to a login page or
+        # shows a "sign in to vote" prompt instead of the vote button.
+        page_text = page.inner_text("body")
+        if any(kw in page_text.lower() for kw in ["sign in", "log in", "login to vote"]):
+            print("[ERROR] Not logged in — the session cookie is invalid or expired.")
+            print("  Re-copy __Secure-authjs.session-token from top.gg and update the GitHub secret.")
+            browser.close()
+            sys.exit(1)
+
+        # ── Find the Vote button ───────────────────────────────────────────
+        print("[INFO] Looking for the Vote button ...")
+        vote_btn = None
+        selectors = [
+            "button:has-text('Vote')",
+            "a:has-text('Vote')",
+            "[data-testid='vote-button']",
+            "button:has-text('vote')",
+        ]
+        try:
+            for sel in selectors:
+                locator = page.locator(sel).first
+                if locator.count() > 0:
+                    locator.wait_for(timeout=BTN_TIMEOUT)
+                    vote_btn = locator
+                    break
+        except PWTimeout:
+            pass
+
+        if vote_btn is None:
+            # Already voted? Check for "already voted" text
+            if any(kw in page_text.lower() for kw in ["already voted", "vote again in", "next vote"]):
+                print("[SKIP] Already voted — next vote not available yet.")
+                browser.close()
+                sys.exit(0)
+            print("[ERROR] Could not find the Vote button on the page.")
+            print("  Page excerpt:", page_text[:400])
+            browser.close()
+            sys.exit(1)
+
+        # ── Click vote ─────────────────────────────────────────────────────
+        print("[INFO] Clicking Vote button ...")
+        vote_btn.click()
+        page.wait_for_timeout(POST_CLICK)   # let the XHR complete
+
+        # ── Interpret result ───────────────────────────────────────────────
+        if vote_result:
+            error      = vote_result.get("error", "NONE")
+            ack        = vote_result.get("isAcknowledged", False)
+            new_count  = vote_result.get("newVoteCount", "?")
+            captcha    = vote_result.get("captchaProvider")
+
+            if captcha:
+                print(f"[ERROR] Captcha triggered ({captcha}). Cannot vote automatically right now.")
+                browser.close()
+                sys.exit(1)
+
+            if error and error != "NONE":
+                print(f"[ERROR] Vote failed: {error}")
+                browser.close()
+                sys.exit(1)
+
+            if ack:
+                print(f"[SUCCESS] ✅ Vote cast! Total Karuta votes: {new_count}")
+            else:
+                print(f"[WARN] Vote response not acknowledged: {vote_result}")
+        else:
+            # No GraphQL response intercepted — check page for feedback
+            updated_text = page.inner_text("body")
+            if any(kw in updated_text.lower() for kw in ["already voted", "vote again"]):
+                print("[SKIP] Already voted — next vote not available yet.")
+            elif "success" in updated_text.lower() or "thank" in updated_text.lower():
+                print("[SUCCESS] ✅ Vote appears to have gone through (no GraphQL response captured).")
+            else:
+                print("[WARN] Voted but could not confirm result from page. Check top.gg manually.")
+
+        browser.close()
 
 
 if __name__ == "__main__":
