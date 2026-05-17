@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Karuta Top.gg Auto-Voter (Playwright edition)
+Karuta Top.gg Auto-Voter (Playwright edition - Robust)
 Uses a real browser context with your session cookie so auth works exactly
-as it does in your browser — no header/cookie guessing needed.
+as it does in your browser.
 
 Required environment variable:
   TOPGG_SESSION_TOKEN  — value of the __Secure-authjs.session-token cookie
@@ -16,10 +16,10 @@ VOTE_URL     = "https://top.gg/bot/646937666251915264/vote"
 COOKIE_NAME  = "__Secure-authjs.session-token"
 SESSION_ENV  = "TOPGG_SESSION_TOKEN"
 
-# ── How long (ms) to wait for various page events ─────────────────────────
-NAV_TIMEOUT  = 30_000   # page navigation
-BTN_TIMEOUT  = 15_000   # vote button to appear
-POST_CLICK   = 5_000    # settle after click
+# ── Timeout Config ────────────────────────────────────────────────────────
+NAV_TIMEOUT  = 40_000   # page navigation (longer for slower runners)
+BTN_TIMEOUT  = 20_000   # wait for elements to load/hydrate
+POST_CLICK   = 8_000    # let the XHR/mutation finish after click
 
 
 def main() -> None:
@@ -30,7 +30,6 @@ def main() -> None:
         print(f"  Copy the value of {COOKIE_NAME} from top.gg DevTools → Application → Cookies.")
         sys.exit(1)
 
-    # Import here so missing dep gives a clear message
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except ImportError:
@@ -38,21 +37,33 @@ def main() -> None:
         sys.exit(1)
 
     with sync_playwright() as pw:
+        # Launch headless browser
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(
+            viewport={"width": 1280, "height": 720},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/148.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             )
         )
 
         # ── Inject session cookie ──────────────────────────────────────────
+        # We set both .top.gg and top.gg to ensure it matches perfectly
         ctx.add_cookies([
             {
                 "name":     COOKIE_NAME,
                 "value":    session_token,
                 "domain":   "top.gg",
+                "path":     "/",
+                "secure":   True,
+                "httpOnly": True,
+                "sameSite": "Lax",
+            },
+            {
+                "name":     COOKIE_NAME,
+                "value":    session_token,
+                "domain":   ".top.gg",
                 "path":     "/",
                 "secure":   True,
                 "httpOnly": True,
@@ -80,56 +91,76 @@ def main() -> None:
         # ── Navigate to vote page ──────────────────────────────────────────
         print(f"[INFO] Loading {VOTE_URL} ...")
         try:
-            page.goto(VOTE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+            # We wait for 'networkidle' so Next.js hydration/session fetching finishes
+            page.goto(VOTE_URL, timeout=NAV_TIMEOUT, wait_until="networkidle")
         except PWTimeout:
-            print("[ERROR] Timed out loading the vote page.")
+            print("[WARN] Timed out waiting for network to be idle. Proceeding with DOM elements...")
+
+        # Let the page hydrate/stabilize for an extra 3 seconds
+        page.wait_for_timeout(3000)
+
+        # ── Wait for either Vote or Login prompt to appear ───────────────
+        print("[INFO] Waiting for page auth hydration...")
+        
+        # We look for the main vote button OR a login state to confirm where we are
+        vote_button_selector = "button:has-text('Vote'), [data-testid='vote-button']"
+        login_indicator_selector = "a:has-text('Login to vote'), button:has-text('Login to vote'), a:has-text('Login')"
+        already_voted_selector = "text='Already voted', text='vote again in', text='Next vote'"
+
+        try:
+            page.locator(f"{vote_button_selector}, {login_indicator_selector}, {already_voted_selector}").first.wait_for(timeout=BTN_TIMEOUT)
+        except PWTimeout:
+            print("[WARN] Page elements didn't stabilize in time. Scanning DOM directly...")
+
+        page_text = page.inner_text("body")
+
+        # ── Check if we need to log in ─────────────────────────────────────
+        # If the page still asks us to log in to vote, the cookie is invalid
+        if "login to vote" in page_text.lower() or "sign in to vote" in page_text.lower():
+            print("[ERROR] Not logged in — the session cookie was rejected by top.gg.")
+            print("  Make sure you copied the correct __Secure-authjs.session-token value.")
+            page.screenshot(path="login_failed.png")
+            print("[INFO] Screenshot saved to 'login_failed.png'.")
             browser.close()
             sys.exit(1)
 
-        # ── Check we're logged in ──────────────────────────────────────────
-        # If the cookie is invalid, top.gg redirects to a login page or
-        # shows a "sign in to vote" prompt instead of the vote button.
-        page_text = page.inner_text("body")
-        if any(kw in page_text.lower() for kw in ["sign in", "log in", "login to vote"]):
-            print("[ERROR] Not logged in — the session cookie is invalid or expired.")
-            print("  Re-copy __Secure-authjs.session-token from top.gg and update the GitHub secret.")
+        # ── Check if we already voted ──────────────────────────────────────
+        if any(kw in page_text.lower() for kw in ["already voted", "vote again in", "next vote"]):
+            print("[SKIP] Already voted — next vote is not available yet.")
             browser.close()
-            sys.exit(1)
+            sys.exit(0)
 
         # ── Find the Vote button ───────────────────────────────────────────
-        print("[INFO] Looking for the Vote button ...")
+        print("[INFO] Locating Vote button ...")
         vote_btn = None
         selectors = [
             "button:has-text('Vote')",
-            "a:has-text('Vote')",
             "[data-testid='vote-button']",
             "button:has-text('vote')",
+            "a:has-text('Vote')",
         ]
-        try:
-            for sel in selectors:
-                locator = page.locator(sel).first
-                if locator.count() > 0:
-                    locator.wait_for(timeout=BTN_TIMEOUT)
-                    vote_btn = locator
-                    break
-        except PWTimeout:
-            pass
+        
+        for sel in selectors:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                vote_btn = loc
+                break
 
         if vote_btn is None:
-            # Already voted? Check for "already voted" text
-            if any(kw in page_text.lower() for kw in ["already voted", "vote again in", "next vote"]):
-                print("[SKIP] Already voted — next vote not available yet.")
-                browser.close()
-                sys.exit(0)
             print("[ERROR] Could not find the Vote button on the page.")
-            print("  Page excerpt:", page_text[:400])
+            page.screenshot(path="vote_btn_missing.png")
+            print("[INFO] Screenshot saved to 'vote_btn_missing.png'.")
+            print("  Page excerpt:", page_text[:600])
             browser.close()
             sys.exit(1)
 
         # ── Click vote ─────────────────────────────────────────────────────
         print("[INFO] Clicking Vote button ...")
         vote_btn.click()
-        page.wait_for_timeout(POST_CLICK)   # let the XHR complete
+        
+        # Wait a bit longer to ensure requests complete
+        print("[INFO] Waiting for vote processing...")
+        page.wait_for_timeout(POST_CLICK)
 
         # ── Interpret result ───────────────────────────────────────────────
         if vote_result:
@@ -139,12 +170,13 @@ def main() -> None:
             captcha    = vote_result.get("captchaProvider")
 
             if captcha:
-                print(f"[ERROR] Captcha triggered ({captcha}). Cannot vote automatically right now.")
+                print(f"[ERROR] Captcha triggered ({captcha}). Automatic voting is blocked by captcha.")
+                page.screenshot(path="captcha_triggered.png")
                 browser.close()
                 sys.exit(1)
 
             if error and error != "NONE":
-                print(f"[ERROR] Vote failed: {error}")
+                print(f"[ERROR] Vote failed with GraphQL error: {error}")
                 browser.close()
                 sys.exit(1)
 
@@ -153,14 +185,15 @@ def main() -> None:
             else:
                 print(f"[WARN] Vote response not acknowledged: {vote_result}")
         else:
-            # No GraphQL response intercepted — check page for feedback
+            # Check updated page text if GraphQL intercept missed it
             updated_text = page.inner_text("body")
             if any(kw in updated_text.lower() for kw in ["already voted", "vote again"]):
-                print("[SKIP] Already voted — next vote not available yet.")
+                print("[SUCCESS] ✅ Vote cast successfully!")
             elif "success" in updated_text.lower() or "thank" in updated_text.lower():
-                print("[SUCCESS] ✅ Vote appears to have gone through (no GraphQL response captured).")
+                print("[SUCCESS] ✅ Vote appears to have gone through successfully.")
             else:
-                print("[WARN] Voted but could not confirm result from page. Check top.gg manually.")
+                print("[WARN] Voted but could not confirm result. Check top.gg manually.")
+                page.screenshot(path="vote_unconfirmed.png")
 
         browser.close()
 
