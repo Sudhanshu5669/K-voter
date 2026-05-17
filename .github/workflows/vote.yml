@@ -1,0 +1,32 @@
+name: Karuta Top.gg Auto-Voter
+
+on:
+  # Run on schedule — every 13 hours
+  # GitHub Actions cron uses UTC. 13h intervals: 00:00, 13:00 UTC
+  schedule:
+    - cron: "0 0,13 * * *"   # 00:00 UTC and 13:00 UTC every day
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  vote:
+    name: Vote for Karuta on top.gg
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Cast vote
+        env:
+          TOPGG_SESSION_TOKEN: ${{ secrets.TOPGG_SESSION_TOKEN }}
+        run: python vote.py
