@@ -108,7 +108,8 @@ def main() -> None:
         already_voted_selector = "text='Already voted', text='vote again in', text='Next vote'"
 
         try:
-            page.locator(f"{vote_button_selector}, {login_indicator_selector}, {already_voted_selector}").first.wait_for(timeout=BTN_TIMEOUT)
+            # Simply wait for the main Next.js div or page content to hydrate
+            page.wait_for_selector("#__next, body", timeout=BTN_TIMEOUT)
         except PWTimeout:
             print("[WARN] Page elements didn't stabilize in time. Scanning DOM directly...")
 
