@@ -18,7 +18,8 @@ import requests
 GRAPHQL_URL = "https://api.top.gg/graphql"
 ENTITY_ID   = "4283790394010009600"   # Karuta's internal top.gg entity ID
 BOT_ID      = "646937666251915264"    # Karuta's Discord app/bot ID
-SESSION_ENV = "TOPGG_SESSION_TOKEN"
+COOKIE_NAME  = "__Secure-authjs.session-token"   # Auth.js v5 cookie name used by top.gg
+SESSION_ENV  = "TOPGG_SESSION_TOKEN"
 
 VOTE_MUTATION = """
 mutation VoteEntity($entityId: String!, $encodedData: String!, $query: String!) {
@@ -76,10 +77,11 @@ def make_encoded_data() -> str:
 def build_cookie_header(session_token: str) -> str:
     """
     Build the Cookie header string.
-    top.gg uses __Secure-next-auth.session-token on HTTPS.
-    The cookie is scoped to .top.gg, so it's also sent to api.top.gg.
+    top.gg uses Auth.js v5 — the session cookie is __Secure-authjs.session-token.
+    It's same-site with api.top.gg so the browser sends it automatically;
+    we replicate that by including it explicitly in the Cookie header.
     """
-    return f"__Secure-next-auth.session-token={session_token}"
+    return f"{COOKIE_NAME}={session_token}"
 
 
 def check_vote_status(session: requests.Session) -> dict:
@@ -92,8 +94,8 @@ def check_vote_status(session: requests.Session) -> dict:
     resp = session.post(GRAPHQL_URL, json=payload, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    entity = data.get("data", {}).get("entity", {})
-    return entity.get("voteStatus", {})
+    entity = (data.get("data") or {}).get("entity") or {}
+    return entity.get("voteStatus") or {}
 
 
 def cast_vote(session: requests.Session) -> dict:
@@ -122,7 +124,7 @@ def main() -> None:
     session_token = os.environ.get(SESSION_ENV, "").strip()
     if not session_token:
         print(f"[ERROR] Environment variable '{SESSION_ENV}' is not set or empty.")
-        print("Set it to the value of the __Secure-next-auth.session-token cookie from top.gg.")
+        print(f"Set it to the value of the {COOKIE_NAME} cookie from top.gg.")
         sys.exit(1)
 
     # ── Set up session ─────────────────────────────────────────────────────
