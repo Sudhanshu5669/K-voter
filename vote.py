@@ -113,26 +113,8 @@ def main() -> None:
         except PWTimeout:
             print("[WARN] Page elements didn't stabilize in time. Scanning DOM directly...")
 
-        page_text = page.inner_text("body")
-
-        # ── Check if we need to log in ─────────────────────────────────────
-        # If the page still asks us to log in to vote, the cookie is invalid
-        if "login to vote" in page_text.lower() or "sign in to vote" in page_text.lower():
-            print("[ERROR] Not logged in — the session cookie was rejected by top.gg.")
-            print("  Make sure you copied the correct __Secure-authjs.session-token value.")
-            page.screenshot(path="login_failed.png")
-            print("[INFO] Screenshot saved to 'login_failed.png'.")
-            browser.close()
-            sys.exit(1)
-
-        # ── Check if we already voted ──────────────────────────────────────
-        if any(kw in page_text.lower() for kw in ["already voted", "vote again in", "next vote"]):
-            print("[SKIP] Already voted — next vote is not available yet.")
-            browser.close()
-            sys.exit(0)
-
-        # ── Find the Vote button ───────────────────────────────────────────
-        print("[INFO] Locating Vote button ...")
+        # ── Find and wait for the Vote button ────────────────────────────────
+        print("[INFO] Waiting for Vote button or status to hydrate...")
         vote_btn = None
         selectors = [
             "button:has-text('Vote')",
@@ -140,18 +122,72 @@ def main() -> None:
             "button:has-text('vote')",
             "a:has-text('Vote')",
         ]
+
+        # We will poll for up to 45 seconds to allow ads / hydration to complete
+        max_wait_seconds = 45
+        start_time = time.time()
+        last_logged_countdown = None
         
-        for sel in selectors:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible():
-                vote_btn = loc
+        while time.time() - start_time < max_wait_seconds:
+            current_text = page.inner_text("body")
+            current_text_lower = current_text.lower()
+            
+            # 1. Check if session expired / not logged in
+            if "login to vote" in current_text_lower or "sign in to vote" in current_text_lower:
+                print("[ERROR] Not logged in — the session cookie was rejected by top.gg.")
+                print("  Make sure you copied the correct __Secure-authjs.session-token value.")
+                page.screenshot(path="login_failed.png")
+                print("[INFO] Screenshot saved to 'login_failed.png'.")
+                browser.close()
+                sys.exit(1)
+
+            # 2. Check if we already voted
+            if any(kw in current_text_lower for kw in ["already voted", "vote again in", "next vote"]):
+                print("[SKIP] Already voted — next vote is not available yet.")
+                browser.close()
+                sys.exit(0)
+            
+            # 3. Check and log ad countdown
+            if "you will be able to vote after this ad" in current_text_lower:
+                lines = current_text.split("\n")
+                countdown_val = None
+                for idx, line in enumerate(lines):
+                    if "you will be able to vote after this ad" in line.lower():
+                        if idx + 1 < len(lines):
+                            next_line = lines[idx+1].strip()
+                            if next_line.isdigit():
+                                countdown_val = int(next_line)
+                                break
+                
+                if countdown_val is not None:
+                    if countdown_val != last_logged_countdown:
+                        print(f"[INFO] Ad is active. Waiting for ad to finish ({countdown_val}s remaining)...")
+                        last_logged_countdown = countdown_val
+                else:
+                    if last_logged_countdown is None:
+                        print("[INFO] Ad is active. Waiting for ad to finish...")
+                        last_logged_countdown = -1
+            
+            # 4. Search for visible and active vote button
+            for sel in selectors:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    if not loc.is_disabled():
+                        vote_btn = loc
+                        break
+                    else:
+                        print(f"[INFO] Vote button found via '{sel}' but it is currently disabled (waiting for ad/hydration)...")
+            
+            if vote_btn is not None:
                 break
+                
+            page.wait_for_timeout(2000)
 
         if vote_btn is None:
             print("[ERROR] Could not find the Vote button on the page.")
             page.screenshot(path="vote_btn_missing.png")
             print("[INFO] Screenshot saved to 'vote_btn_missing.png'.")
-            print("  Page excerpt:", page_text[:600])
+            print("  Page excerpt:", page.inner_text("body")[:800])
             browser.close()
             sys.exit(1)
 
