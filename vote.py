@@ -12,6 +12,12 @@ import os
 import sys
 import time
 
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+except ImportError:
+    sync_playwright = None
+    PWTimeout = None
+
 VOTE_URL     = "https://top.gg/bot/646937666251915264/vote"
 COOKIE_NAME  = "__Secure-authjs.session-token"
 SESSION_ENV  = "TOPGG_SESSION_TOKEN"
@@ -22,20 +28,11 @@ BTN_TIMEOUT  = 20_000   # wait for elements to load/hydrate
 POST_CLICK   = 8_000    # let the XHR/mutation finish after click
 
 
-def main() -> None:
-    # ── Read session token ─────────────────────────────────────────────────
-    session_token = os.environ.get(SESSION_ENV, "").strip()
-    if not session_token:
-        print(f"[ERROR] '{SESSION_ENV}' env var is not set.")
-        print(f"  Copy the value of {COOKIE_NAME} from top.gg DevTools → Application → Cookies.")
-        sys.exit(1)
-
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        print("[ERROR] Playwright not installed. Run: pip install playwright && playwright install chromium")
-        sys.exit(1)
-
+def run_vote_attempt(session_token: str, attempt: int, max_retries: int) -> tuple[bool, str]:
+    """
+    Performs a single voting attempt.
+    Returns a tuple: (success_or_skip, result_type)
+    """
     with sync_playwright() as pw:
         # Launch headless browser
         browser = pw.chromium.launch(headless=True)
@@ -102,11 +99,6 @@ def main() -> None:
         # ── Wait for either Vote or Login prompt to appear ───────────────
         print("[INFO] Waiting for page auth hydration...")
         
-        # We look for the main vote button OR a login state to confirm where we are
-        vote_button_selector = "button:has-text('Vote'), [data-testid='vote-button']"
-        login_indicator_selector = "a:has-text('Login to vote'), button:has-text('Login to vote'), a:has-text('Login')"
-        already_voted_selector = "text='Already voted', text='vote again in', text='Next vote'"
-
         try:
             # Simply wait for the main Next.js div or page content to hydrate
             page.wait_for_selector("#__next, body", timeout=BTN_TIMEOUT)
@@ -139,13 +131,13 @@ def main() -> None:
                 page.screenshot(path="login_failed.png")
                 print("[INFO] Screenshot saved to 'login_failed.png'.")
                 browser.close()
-                sys.exit(1)
+                return False, "LOGIN_FAILED"
 
             # 2. Check if we already voted
             if any(kw in current_text_lower for kw in ["already voted", "vote again in", "next vote"]):
                 print("[SKIP] Already voted — next vote is not available yet.")
                 browser.close()
-                sys.exit(0)
+                return True, "ALREADY_VOTED"
             
             # 3. Check and log ad countdown
             if "you will be able to vote after this ad" in current_text_lower:
@@ -189,7 +181,7 @@ def main() -> None:
             print("[INFO] Screenshot saved to 'vote_btn_missing.png'.")
             print("  Page excerpt:", page.inner_text("body")[:800])
             browser.close()
-            sys.exit(1)
+            return False, "NO_VOTE_BUTTON"
 
         # ── Click vote ─────────────────────────────────────────────────────
         print("[INFO] Clicking Vote button ...")
@@ -208,31 +200,87 @@ def main() -> None:
 
             if captcha:
                 print(f"[ERROR] Captcha triggered ({captcha}). Automatic voting is blocked by captcha.")
-                page.screenshot(path="captcha_triggered.png")
+                screenshot_filename = f"captcha_triggered_attempt_{attempt}.png"
+                page.screenshot(path=screenshot_filename)
+                print(f"[INFO] Screenshot saved to '{screenshot_filename}'.")
                 browser.close()
-                sys.exit(1)
+                return False, "CAPTCHA"
 
             if error and error != "NONE":
                 print(f"[ERROR] Vote failed with GraphQL error: {error}")
                 browser.close()
-                sys.exit(1)
+                return False, "VOTE_FAILED"
 
             if ack:
                 print(f"[SUCCESS] ✅ Vote cast! Total Karuta votes: {new_count}")
+                browser.close()
+                return True, "SUCCESS"
             else:
                 print(f"[WARN] Vote response not acknowledged: {vote_result}")
+                browser.close()
+                return True, "UNCONFIRMED"
         else:
             # Check updated page text if GraphQL intercept missed it
             updated_text = page.inner_text("body")
             if any(kw in updated_text.lower() for kw in ["already voted", "vote again"]):
                 print("[SUCCESS] ✅ Vote cast successfully!")
+                browser.close()
+                return True, "SUCCESS"
             elif "success" in updated_text.lower() or "thank" in updated_text.lower():
                 print("[SUCCESS] ✅ Vote appears to have gone through successfully.")
+                browser.close()
+                return True, "SUCCESS"
             else:
                 print("[WARN] Voted but could not confirm result. Check top.gg manually.")
                 page.screenshot(path="vote_unconfirmed.png")
+                browser.close()
+                return True, "UNCONFIRMED"
 
-        browser.close()
+
+def main() -> None:
+    # ── Read session token ─────────────────────────────────────────────────
+    session_token = os.environ.get(SESSION_ENV, "").strip()
+    if not session_token:
+        print(f"[ERROR] '{SESSION_ENV}' env var is not set.")
+        print(f"  Copy the value of {COOKIE_NAME} from top.gg DevTools → Application → Cookies.")
+        sys.exit(1)
+
+    if sync_playwright is None or PWTimeout is None:
+        print("[ERROR] Playwright not installed. Run: pip install playwright && playwright install chromium")
+        sys.exit(1)
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 2):
+        if attempt > 1:
+            print(f"\n[INFO] --- Starting Retry Attempt {attempt - 1}/{max_retries} ---")
+            time.sleep(5)
+
+        print(f"[INFO] Starting vote attempt {attempt} of {max_retries + 1}...")
+        try:
+            success, result_type = run_vote_attempt(session_token, attempt, max_retries)
+            if success:
+                sys.exit(0)
+            
+            if result_type == "CAPTCHA":
+                if attempt <= max_retries:
+                    print(f"[WARN] Captcha encountered on attempt {attempt}. Resetting browser and retrying...")
+                    continue
+                else:
+                    print(f"[ERROR] Captcha encountered on attempt {attempt}. Max retries ({max_retries}) reached. Exiting.")
+                    sys.exit(1)
+            elif result_type == "LOGIN_FAILED":
+                sys.exit(1)
+            else:
+                # For other errors (e.g. NO_VOTE_BUTTON, VOTE_FAILED), exit immediately
+                sys.exit(1)
+
+        except Exception as e:
+            print(f"[ERROR] Attempt {attempt} failed with unexpected exception: {e}")
+            if attempt <= max_retries:
+                print("[INFO] Resetting browser and retrying...")
+                continue
+            else:
+                sys.exit(1)
 
 
 if __name__ == "__main__":
