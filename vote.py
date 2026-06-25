@@ -207,6 +207,10 @@ def run_vote_attempt(session_token: str, attempt: int, max_retries: int) -> tupl
                 return False, "CAPTCHA"
 
             if error and error != "NONE":
+                if error == "USER_ALREADY_VOTED" or "already" in error.lower():
+                    print(f"[SKIP] Already voted — next vote is not available yet (GraphQL error: {error}).")
+                    browser.close()
+                    return True, "ALREADY_VOTED"
                 print(f"[ERROR] Vote failed with GraphQL error: {error}")
                 browser.close()
                 return False, "VOTE_FAILED"
